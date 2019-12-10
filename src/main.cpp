@@ -298,6 +298,7 @@ int main() {
             double shift_x = ptsx[i] - ref_x;
             double shift_y = ptsy[i] - ref_y;
 
+            // shift transform from waypoints map coordinates to local vehicle coordinate
             ptsx[i] = (shift_x * cos(0-ref_yaw)-shift_y*sin(0-ref_yaw));
             ptsy[i] = (shift_x * sin(0-ref_yaw)+shift_y*cos(0-ref_yaw));
           }
@@ -355,7 +356,7 @@ int main() {
             double y_ref = y_point;
 
             // rotate back to normal after rotating it earlier
-            // we do the inverse of what we were doing before, we do a shift, then rotation
+            // rotate transform back to waypoints map coordinates from local vehicle coordinate
             x_point = (x_ref * cos(ref_yaw)-y_ref * sin(ref_yaw));
             y_point = (x_ref * sin(ref_yaw)+y_ref * cos(ref_yaw));
 
