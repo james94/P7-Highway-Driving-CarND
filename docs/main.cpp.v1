@@ -1,0 +1,499 @@
+#include <uWS/uWS.h>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+#include "Eigen-3.3/Eigen/Core"
+#include "Eigen-3.3/Eigen/QR"
+#include "helpers.h"
+#include "json.hpp"
+#include "spline.h"
+
+// for convenience
+using nlohmann::json;
+using std::string;
+using std::vector;
+
+int main() {
+  uWS::Hub h;
+
+  // Load up map values for waypoint's x,y,s and d normalized normal vectors
+  vector<double> map_waypoints_x;
+  vector<double> map_waypoints_y;
+  vector<double> map_waypoints_s;
+  vector<double> map_waypoints_dx;
+  vector<double> map_waypoints_dy;
+
+  // Waypoint map to read from
+  string map_file_ = "../data/highway_map.csv";
+  // The max s value before wrapping around the track back to 0
+  double max_s = 6945.554;
+
+  std::ifstream in_map_(map_file_.c_str(), std::ifstream::in);
+
+  string line;
+  while (getline(in_map_, line)) {
+    std::istringstream iss(line);
+    double x;
+    double y;
+    float s;
+    float d_x;
+    float d_y;
+    iss >> x;
+    iss >> y;
+    iss >> s;
+    iss >> d_x;
+    iss >> d_y;
+    map_waypoints_x.push_back(x);
+    map_waypoints_y.push_back(y);
+    map_waypoints_s.push_back(s);
+    map_waypoints_dx.push_back(d_x);
+    map_waypoints_dy.push_back(d_y);
+  }
+
+  // start in lane 1 (can use to quickly switch to other lanes if needed)
+  // lane 0 is far left lane, lane 1 is middle, lane 2 is right
+  int lane = 2;
+
+  // tell it some reference velocity, want to go as close to the speed limit
+  // possible, I don't want to go over it, so I am doing 49.5
+  // setting ref_vel to 0 will get rid of the cold start problem going from
+  // 0 to 49.5 instantly. Let's see how we can speed the car up.
+  double ref_vel = 0; // mph
+
+  h.onMessage([&ref_vel, &map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
+               &map_waypoints_dx,&map_waypoints_dy, &lane]
+              (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+               uWS::OpCode opCode) {
+    // "42" at the start of the message means there's a websocket message event.
+    // The 4 signifies a websocket message
+    // The 2 signifies a websocket event
+    if (length && length > 2 && data[0] == '4' && data[1] == '2') {
+
+      auto s = hasData(data);
+
+      if (s != "") {
+        auto j = json::parse(s);
+        
+        string event = j[0].get<string>();
+        
+        if (event == "telemetry") {
+          // j[1] is the data JSON object
+          
+          // Main car's localization Data
+          double car_x = j[1]["x"];
+          double car_y = j[1]["y"];
+          double car_s = j[1]["s"];
+          double car_d = j[1]["d"];
+          double car_yaw = j[1]["yaw"];
+          double car_speed = j[1]["speed"];
+
+          // Previous path data given to the Planner
+          auto previous_path_x = j[1]["previous_path_x"];
+          auto previous_path_y = j[1]["previous_path_y"];
+          // Previous path's end s and d values 
+          double end_path_s = j[1]["end_path_s"];
+          double end_path_d = j[1]["end_path_d"];
+
+          // Sensor Fusion Data, a list of all other cars on the same side 
+          //   of the road.
+          auto sensor_fusion = j[1]["sensor_fusion"];
+
+          /**
+           * TODO: define a path made up of (x,y) points that the car will visit
+           *   sequentially every .02 seconds
+           */
+
+          // set previous size, which comes from previous path size
+          // I have this previous list of points and that can really help
+          // when I am doing a transition. This is the last path the car
+          // was following, before it does this runthrough of calculating
+          // more points? And the simulator will tell me what that previous
+          // path was. Will that be 50 because the path is always 50 points?
+          // you could do 100, even 1000. You have alot of freedom to have
+          // this path planner do as many points ahead as you want.
+          // there are advantages and disadvantages to doing that. If it
+          // gets stuck at 1000 and you're using previous points, maybe there
+          // is some sudden change in the environment and it wouldn't be able
+          // to react in time because it is stuck using those previous points
+          int prev_size = previous_path_x.size();
+
+          // Sensor Fusion
+          // The simulator is reporting this list of all the other cars on the road
+          // and all these cars have some kind of s, d, x, y, vx, vy values
+          // We want to use that to figure out where cars are at, how fast they are going
+          // and how we should behave as a result. 
+
+          // I look at the previous path size and if I have points to work with,
+          // I am going to change the car s, so it is actually representative of
+          // the previous path laps points s. So, I'm going to be doing this in frenet
+          // because it is easy if I work in Frenet for doing this kind of logic
+          if(prev_size > 0)
+          {
+            car_s = end_path_s;
+          }
+          
+          // So, if we want to avoid hitting a car in front of us, we need to go through
+          // this sensor fusion list and see if a car is in our lane or not and then how
+          // close that car is to us. if it is too close, we do some action.
+          bool too_close = false;
+
+          // find ref_v to use
+          // sensor_fusion is a vector vector double. So, the outer vector is storing a
+          // list of car parameters for each car on the road and the inner vector is
+          // each of those parameters. So, sensor fusion i is going to be the ith car
+          // on the road. In the README, it has this template of how you can access all
+          // the different data for that. We're running a for loop over all of these cars
+          for(int i = 0; i < sensor_fusion.size(); i++)
+          {
+              // car is in my lane
+            // so for each car, we're starting out a block in the loop by saying 
+            // what's the D value of that car. That D value will tell us what lane that car is in.
+            // We care about the car in this case if it is in our lane.
+            // for instance, I'm going to look at D value, D I can think of as saying
+            // whether a car is in what lane
+            // sensor_fusion index i, index 6 is the 6th value of the ith car on the road
+            // and the 6th value is the D value in frenet coordinates
+            float d = sensor_fusion[i][6];
+
+            // we have our lane and we're trying to see if it is in this range or not
+            // there's this +2 -2 difference in the lane since each lane is 4 meters
+            // so we're trying to see if the car is in that center lane. Is it between
+            // 4 and 8? 
+            // We could just say is the car at 6, but that would only give us the
+            // middle lane. We could just say is the car at 2+4*lane and that would give us
+            // any of the lanes, but it would only give us the center value. So, if the car
+            // is in that lane, but off center, we're going to need to check this range
+            // to see where the car is. We could even make it narrower if we wanted.
+            // if it is in my lane, then I'm going to check out the speed of the car.
+            if(d < (2+4*lane+2) && d > (2+4*lane-2))
+            {
+              // I pull speed info from vx and vy, the 3rd and 4th elements
+              double vx = sensor_fusion[i][3];
+              double vy = sensor_fusion[i][4];
+              // then check the speed, I'm calculating the velocity magnitude of it
+              // that speed turns out to be helpful in predicting where that car will
+              // be in the future
+              double check_speed = sqrt(vx*vx + vy*vy);
+              // pull the s value of this car, important to know whether that car
+              // is close to us or not in north south direction
+              double check_car_s = sensor_fusion[i][5];
+
+              // if using the previous points, we can project s value outwards in time
+              // why would we want to project the s value outwards?
+              // because if we're using the previous path points, we're not quite
+              // there yet. Our car is still a little bit under that. We want to be
+              // looking at what will the car be looking like in the future.
+              // because if we're using the previous path points, our path represents
+              // a future, but we're looking at this current snapshot of where our
+              // car sits and all the other cars. So from the perspective of the
+              // previous path, we want to say where those other cars will look like
+              // in the future. So, we're looking where the car is at in the future
+              check_car_s += ((double)prev_size*0.02*check_speed);
+              // check s values greater than mine and s gap
+              // doing logic to see if our car s is close to this other car_s
+              // So, if the check_car_s is greater than car_s if it is in front of us
+              // and the gap is smaller than 30 meters, then we need to take action
+              // So, if our car in the future is going to be within 30 meters of this
+              // particular car in the future, then we need to take action.
+              if( (check_car_s > car_s) && (check_car_s - car_s < 30) )
+              {
+                // Do some logic here, lower reference velocity, so we don't crash
+                // into the car in front of us, could also flag to try to change lanes
+                //ref_vel = 29.5; // mph
+                too_close = true;
+
+                // What about some of the "finite state machine" stuff
+                // that we saw in the behavioral planning lesson?
+                // we're doing something pretty simple for doing our
+                // lane shift, but really we might actually want to
+                // think about looking at other cars in that lane
+                // first using similar logic to seeing if there is
+                // a car in front of us or not. Going back to frenet
+                // we can check if a car is in that lane or not
+                // and then we can check if it is in some gap range
+                // of s, if it is, then it is not safe to do that
+                // lane change. Maybe if it is not safe to go left,
+                // then we can try to go right instead. So you could
+                // have a lane change left, right, keep lane and you
+                // would never enter lane change left if you saw there is
+                // another car within like 30 or maybe 100 meters in
+                // front of you or 50 meters behind you or if you
+                // are already in that leftmost lane, then you don't
+                // want to go off the road. So you would start to add
+                // some logic around when do you shift to each of those
+                // states in the finite state machine.
+
+                // if the lane our car is in is greater than 0
+                // if we are in the middle or right lane
+                if(lane > 0)
+                {
+                  // make our car do a left turn
+                  // slam over to the left as fast as we can
+                  // blindly do a left turn regardless if there's cars.
+                  // the spline interpreted the lane change here
+                  lane = 0;
+                }
+              }
+            }
+          }
+
+          // look at too_close flag and if it is too close
+          // How will this slow down the car at the very beginning?
+          // this looks like it deals with slowing down the car if the car
+          // pulls up on another car in front of it. There is 1 more thing
+          // we need to do in order to address that. We go to where we initialized
+          // ref_val.
+          if(too_close)
+          {
+            // I'll be subtracting some constant value, 0.224 from the reference velocity
+            // It ends up being 5 meters per second squared, which is under the 10 requirement
+            ref_vel -= 0.224;
+          } // if ref_vel < 49.5, then start accelerating, but accelerate slowly
+          // this will be doing that increment 0.224 every cycle. We could be more
+          // efficient with that, come down to our path planner where it's going
+          // through every point and changing ref vel there
+          else if(ref_vel < 49.5)
+          {
+            ref_vel += 0.224;
+          }
+
+          // How does the reference velocity up here affect the waypoints that get
+          // calculated later? That affects our end value N. We pass ref vel to it
+
+
+          // Create a list of widely spaced (x, y) waypoints, evenly spaced at 30m
+          // Later we will integpolate these waypoints with a spline and fill in with more points that control speed
+          vector<double> ptsx;
+          vector<double> ptsy;
+
+          // reference x,y, yaw states
+          // either we will reference the starting point as where the car is or at the previous paths end point
+          double ref_x = car_x;
+          double ref_y = car_y;
+          double ref_yaw = deg2rad(car_yaw);
+
+          // if previous size is almost empty, use the car as starting reference
+          // that is if I am just starting out and don't have any previous path points
+          if(prev_size < 2)
+          {
+            // Use two points that make the path tangent to the angle of the car
+            // look at where the car is at and go back in time based on the angle
+            double prev_car_x = car_x - cos(car_yaw);
+            double prev_car_y = car_y - sin(car_yaw);
+
+            // generate two points to make sure that path is tangent
+            ptsx.push_back(prev_car_x);
+            ptsx.push_back(car_x);
+
+            ptsy.push_back(prev_car_y);
+            ptsy.push_back(car_y);
+          }
+          // use the previous path's endpoint as starting reference
+          else
+          {
+            // make sure it is tangent by using the last point in the previous path
+            // and its second to last point and adding this to my x points and y points
+
+            // what were the last couople of points that the car was following, then
+            // calculating what angle the car was heading in using those last couple of points
+            ref_x = previous_path_x[prev_size-1];
+            ref_y = previous_path_y[prev_size-1];
+
+            double ref_x_prev = previous_path_x[prev_size-2];
+            double ref_y_prev = previous_path_y[prev_size-2];
+            ref_yaw = atan2(ref_y-ref_y_prev, ref_x-ref_x_prev);
+
+            // Use two points that make the path tangent to the previous path's end point
+            // Push them onto a list of previous points, 2 points on this pair of vectors
+            ptsx.push_back(ref_x_prev);
+            ptsx.push_back(ref_x);
+
+            ptsy.push_back(ref_y_prev);
+            ptsy.push_back(ref_y);
+
+          }
+
+          // that is my starting reference and here is some other points
+          // I am using frenet and making sure there is space pretty far apart
+          // instead of looking at 1 distance inc, you're looking out 30, 60, 90
+          // instead of looping and creating 50, you're creating 3
+          // so I am pushing 3 more points, but instead of them being 0.5 meters spaced
+          // they are all the way to 30. where I had 6 as the d coord, you have 2+4*lane
+          vector<double> next_wp0 = getXY(car_s+30,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          vector<double> next_wp1 = getXY(car_s+60,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          vector<double> next_wp2 = getXY(car_s+90,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          
+          // i go ahead and push those points
+          // what do these vectors of points have now?
+          // they have the 2 previous points, plus they have the location of the car in 30 meters, 60, 90
+          // so it has 5 points on it now
+
+          ptsx.push_back(next_wp0[0]);
+          ptsx.push_back(next_wp1[0]);
+          ptsx.push_back(next_wp2[0]);
+
+          ptsy.push_back(next_wp0[1]);
+          ptsy.push_back(next_wp1[1]);
+          ptsy.push_back(next_wp2[1]);
+
+          // do a transformation to this local cars coordinates, we shift it so we make sure the
+          // car or that last point of the previous path is at zero, zero, the origin
+          // and its angle is at 0 degrees
+
+          // we're taking it that the car is heading in x, y coord and want to take the car's
+          // reference frame. so, it's just going straight ahead instead of being at 45 degrees
+          // , it should always be at 0 degrees. makes the math easier to work with
+          // so this is some of the math you might recognize from mpc
+
+          for(int i = 0; i < ptsx.size(); ++i)
+          {
+            // shift car reference angle to 0 degrees
+            double shift_x = ptsx[i] - ref_x;
+            double shift_y = ptsy[i] - ref_y;
+
+            ptsx[i] = (shift_x * cos(0-ref_yaw)-shift_y*sin(0-ref_yaw));
+            ptsy[i] = (shift_x * sin(0-ref_yaw)+shift_y*cos(0-ref_yaw));
+          }
+
+          // create a spline
+          tk::spline s;
+
+          // set points x,y to the spline
+
+          // I added these points to the spline, but I want to figure out how
+          // to space these points along the spline, so that I go at my desired
+          // speed. These are those 5 anchor points, not the previous path points.
+          // we're dealing with 2 sets: far spaced waypoints that make up the spline
+          // we deal with our path planning points. first set are our anchor points.
+          // the next set will be the next x vals or future path
+          s.set_points(ptsx,ptsy);
+
+          // Define the actual (x,y) points we will use for the planner
+          // we have this one set of x,y points and now we got this other set
+          // that's empty at the moment that we need to build the future path in
+          vector<double> next_x_vals;
+          vector<double> next_y_vals;
+
+          // loaded up future path with whatever was left of the previous path
+          // so, there is some continuity. So, now we are back to looking at
+
+          // Start with all of the previous path points from last time
+          // if I have any points from my previous path, I am going to add
+          // them to my path planner. This helps out with the transition
+          // so, you make sure instead of recreating the path from scratch
+          // every single time, why not just add points onto it and work
+          // with what you still had left from last time
+          for(int i = 0; i < previous_path_x.size(); ++i)
+          {
+            next_x_vals.push_back(previous_path_x[i]);
+            next_y_vals.push_back(previous_path_y[i]);
+          }
+
+          // Calculate how to break up spline points, so we travel at our
+          // desired reference velocity
+
+          // our horizon going out 30m
+          double target_x = 30.0;
+          // our y, ask spline what's the y for that given x
+          double target_y = s(target_x);
+          // we have target distance that is doing that distance calc from the car
+          // whether it be the last point or previous path or the car itself to that target
+          double target_dist = sqrt((target_x)*(target_x)+(target_y)*(target_y));
+          // starts at 0, has to do with that local transformation we did, start at 0
+          double x_add_on = 0;
+          
+          // so now we are just adding those points that are along the spline
+
+          // So if the previous path was 50 points, then there are always
+          // going to be 50 points here that we add on. 
+          // Isn't this 50-previous_path_x.size() always going to be 0, it's
+          // previous_path_x.size() is 50? previous_path_x.size() will be < 50
+          // let's say you are running an iteration and generate 50 points,
+          // maybe the simulator goes through 3 of those points, so you have 47
+          // left over that it is going to report the next time around
+          // so, previous_path_x.size() is not the full previous path, it's
+          // whatever kind of path pac-man nuggets in the previous path didn't
+          // get eaten up by the car. So, if the car ate up 3 points in the 50
+          // point path last time, the previous path will have 47 remaining points
+          // so we only need to generate 3 points. Or if the car ate up 40 points,
+          // previous path will have 10 points left
+
+          for(int i = 1; i <= 50-previous_path_x.size(); ++i)
+          {
+            // N equation is affected by ref vel. If we + or - ref vel in that loop,
+            // will be alot more efficient
+            // this is the math from the previous slide 
+            // I'm dividing it by 2.24 since it is in mph and it needs
+            // to be in meters per second
+            double N = (target_dist/(0.02*ref_vel/2.24));
+            // is whatever the x_add_on was before plus target x divided by N
+            // x point is each of those hash marks on the x axis of that visual
+            // x add on is where we start, it's going to be 0, then we're adding
+            // on our target x divided by N, which is the number of hash marks
+            double x_point = x_add_on+(target_x)/N;
+
+            // to get y point, ask the spline what the y point is from the x point
+            // so that tells us on the spline where each little pearl or
+            // pac-man nugget or waypoint actually, such that they are
+            // far enough apart that the car goes the right speed
+            // in our case, we want to try to go 49.5 mph 
+            double y_point = s(x_point);
+
+            x_add_on = x_point;
+
+            double x_ref = x_point;
+            double y_ref = y_point;
+
+            // rotate back to normal after rotating it earlier
+            // we do the inverse of what we were doing before
+            // we do a shift here, then rotation
+            x_point = (x_ref * cos(ref_yaw)-y_ref * sin(ref_yaw));
+            y_point = (x_ref * sin(ref_yaw)+y_ref * cos(ref_yaw));
+
+            x_point += ref_x;
+            y_point += ref_y;
+
+            // push that back to our next x and y vals and we're done!
+            next_x_vals.push_back(x_point);
+            next_y_vals.push_back(y_point);
+          }
+
+          // END
+
+          json msgJson;
+          msgJson["next_x"] = next_x_vals;
+          msgJson["next_y"] = next_y_vals;
+
+          auto msg = "42[\"control\","+ msgJson.dump()+"]";
+
+          ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+        }  // end "telemetry" if
+      } else {
+        // Manual driving
+        std::string msg = "42[\"manual\",{}]";
+        ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+      }
+    }  // end websocket if
+  }); // end h.onMessage
+
+  h.onConnection([&h](uWS::WebSocket<uWS::SERVER> ws, uWS::HttpRequest req) {
+    std::cout << "Connected!!!" << std::endl;
+  });
+
+  h.onDisconnection([&h](uWS::WebSocket<uWS::SERVER> ws, int code,
+                         char *message, size_t length) {
+    ws.close();
+    std::cout << "Disconnected" << std::endl;
+  });
+
+  int port = 4567;
+  if (h.listen(port)) {
+    std::cout << "Listening to port " << port << std::endl;
+  } else {
+    std::cerr << "Failed to listen to port" << std::endl;
+    return -1;
+  }
+  
+  h.run();
+}
