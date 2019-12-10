@@ -103,9 +103,9 @@ Open your terminal (Windows 10 Ubuntu Bash Shell, Linux Shell, Mac OS X Shell), 
 git clone https://github.com/james94/P7-Highway-Driving-CarND
 ~~~
 
-This project requires using open source package **[uWebSocketIO](https://github.com/uNetworking/uWebSockets)**. This package facilitates the connection between the simulator and C++ code used in this EKF project by setting up a web socket server connection from the C++ program to the simulator. The C++ program software is a web server and the simulator is a client. There are two scripts for installing **uWebSocketIO** - one for Linux and the other for macOS. 
+This project requires using open source package **[uWebSocketIO](https://github.com/uNetworking/uWebSockets)**. This package facilitates the connection between the simulator and C++ code used in this Path Planning project by setting up a web socket server connection from the C++ program to the simulator. The C++ program software is a web server and the simulator is a client. There are two scripts for installing **uWebSocketIO** - one for Linux and the other for macOS. 
 
-Run the shell script below to install **uWebSocketIO**, build and compile the C++ EKF program:
+Run the shell script below to install **uWebSocketIO**, build and compile the C++ Path Planning program:
 
 ~~~bash
 cd P7-Highway-Driving-CarND
